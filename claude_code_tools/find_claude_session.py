@@ -130,60 +130,79 @@ def get_claude_project_dir(claude_home: Optional[str] = None) -> Path:
     return claude_dir
 
 
+def _reconstruct_path_from_encoded(encoded_name: str) -> Optional[str]:
+    """
+    Reconstruct original filesystem path from Claude's hyphen-encoded directory name.
+
+    Claude encodes paths by replacing '/' with '-', which is lossy when directory
+    names contain hyphens. This function uses filesystem existence checks to find
+    the correct path.
+
+    Args:
+        encoded_name: The encoded directory name (e.g., "-Users-foo-my-project")
+
+    Returns:
+        The original path if found, or None if reconstruction failed.
+    """
+    # Remove leading hyphen and split by hyphens
+    if encoded_name.startswith("-"):
+        encoded_name = encoded_name[1:]
+
+    parts = encoded_name.split("-")
+    if not parts:
+        return None
+
+    def find_valid_path(current_path: str, remaining_parts: List[str]) -> Optional[str]:
+        """Recursively find a valid path by trying different hyphen interpretations."""
+        if not remaining_parts:
+            # No more parts - check if this path exists
+            return current_path if os.path.isdir(current_path) else None
+
+        # Try progressively longer segments (greedy: prefer longer directory names)
+        # This handles cases like "aiml-lectio-2nd-clone" being a single directory
+        for i in range(len(remaining_parts), 0, -1):
+            segment = "-".join(remaining_parts[:i])
+            candidate = os.path.join(current_path, segment)
+
+            if os.path.isdir(candidate):
+                result = find_valid_path(candidate, remaining_parts[i:])
+                if result:
+                    return result
+
+        return None
+
+    # Start reconstruction from root
+    result = find_valid_path("/", parts)
+    return result
+
+
 def get_all_claude_projects(claude_home: Optional[str] = None) -> List[Tuple[Path, str]]:
     """Get all Claude project directories with their original paths."""
     # Use provided claude_home, CLAUDE_CONFIG_DIR env var, or default to ~/.claude
     base_dir = get_claude_home(claude_home)
 
     projects_dir = base_dir / "projects"
-    
+
     if not projects_dir.exists():
         return []
-    
+
     projects = []
     for project_dir in projects_dir.iterdir():
         if project_dir.is_dir():
-            # Convert back from Claude's naming to original path
-            # Claude's pattern: -Users-username-path-to-project
-            # where only path separators (/) are replaced with -
             dir_name = project_dir.name
-            
-            # Split by - but need to be smart about it
-            # Pattern is like: -Users-pchalasani-Git-project-name
-            # We need to identify which hyphens are path separators vs part of names
-            
-            # Most reliable approach: use known path patterns
-            if dir_name.startswith("-Users-"):
-                # macOS path
-                parts = dir_name[1:].split("-")
-                # Reconstruct, assuming first few parts are the path
-                # Pattern: Users/username/...
-                if len(parts) >= 2:
-                    # Try to reconstruct the path
-                    # We know it starts with /Users/username
-                    original_path = "/" + parts[0] + "/" + parts[1]
-                    
-                    # For the rest, we need to be careful
-                    # Common patterns: /Users/username/Git/project-name
-                    remaining = "-".join(parts[2:])
-                    
-                    # Check for common directories
-                    if remaining.startswith("Git-"):
-                        original_path += "/Git/" + remaining[4:]
-                    elif remaining:
-                        # Just append the rest as is
-                        original_path += "/" + remaining
-                else:
+
+            # Try smart reconstruction using filesystem checks
+            original_path = _reconstruct_path_from_encoded(dir_name)
+
+            if original_path is None:
+                # Fallback: simple replacement (may be incorrect for paths with hyphens)
+                if dir_name.startswith("-"):
                     original_path = "/" + dir_name[1:].replace("-", "/")
-            elif dir_name.startswith("-home-"):
-                # Linux path
-                original_path = "/" + dir_name[1:].replace("-", "/")
-            else:
-                # Unknown pattern, best guess
-                original_path = "/" + dir_name.replace("-", "/")
-            
+                else:
+                    original_path = "/" + dir_name.replace("-", "/")
+
             projects.append((project_dir, original_path))
-    
+
     return projects
 
 
@@ -1265,21 +1284,34 @@ def resume_session(session_id: str, project_path: str, shell_mode: bool = False,
             print("fcs() { eval $(find-claude-session --shell \"$@\"); }")
             print("Then use 'fcs' instead of 'find-claude-session'\n")
     
-    try:
-        # Change directory if needed (won't persist after exit)
-        if change_dir and project_path != current_dir:
+    # Change directory if needed (won't persist after exit)
+    if change_dir and project_path != current_dir:
+        if not os.path.isdir(project_path):
+            if RICH_AVAILABLE and console:
+                console.print(f"[red]Error:[/red] Session directory does not exist: {project_path}")
+                console.print("[yellow]Hint:[/yellow] The path may have been incorrectly reconstructed from Claude's encoded format.")
+            else:
+                print(f"Error: Session directory does not exist: {project_path}", file=sys.stderr)
+            sys.exit(1)
+        try:
             os.chdir(project_path)
+        except OSError as e:
+            if RICH_AVAILABLE and console:
+                console.print(f"[red]Error:[/red] Cannot change to directory: {e}")
+            else:
+                print(f"Error: Cannot change to directory: {e}", file=sys.stderr)
+            sys.exit(1)
 
-        # Set CLAUDE_CONFIG_DIR environment variable if custom path specified
-        # (either via CLI arg or already set via env var)
-        if claude_home or os.environ.get('CLAUDE_CONFIG_DIR'):
-            # Get the resolved home directory (respects precedence)
-            expanded_home = str(get_claude_home(claude_home).absolute())
-            os.environ['CLAUDE_CONFIG_DIR'] = expanded_home
+    # Set CLAUDE_CONFIG_DIR environment variable if custom path specified
+    # (either via CLI arg or already set via env var)
+    if claude_home or os.environ.get('CLAUDE_CONFIG_DIR'):
+        # Get the resolved home directory (respects precedence)
+        expanded_home = str(get_claude_home(claude_home).absolute())
+        os.environ['CLAUDE_CONFIG_DIR'] = expanded_home
 
+    try:
         # Execute claude
         os.execvp("claude", ["claude", "-r", session_id])
-        
     except FileNotFoundError:
         if RICH_AVAILABLE and console:
             console.print("[red]Error:[/red] 'claude' command not found. Make sure Claude CLI is installed.")
