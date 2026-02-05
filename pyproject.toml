@@ -30,6 +30,10 @@ gdocs = [
 # All session commands accessible via: aichat <subcommand>
 aichat = "claude_code_tools.aichat:main"
 
+# Legacy entry points (kept for backward compatibility)
+find-session = "claude_code_tools.find_session:main"
+find-claude-session = "claude_code_tools.find_claude_session:main"
+
 # Non-session utilities
 vault = "claude_code_tools.dotenv_vault:main"
 tmux-cli = "claude_code_tools.tmux_cli_controller:main"
