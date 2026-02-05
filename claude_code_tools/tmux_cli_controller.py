@@ -7,7 +7,7 @@ This script provides functions to interact with CLI applications running in tmux
 import subprocess
 import time
 import re
-from typing import Optional, List, Dict, Tuple, Callable, Union
+from typing import Optional, List, Dict, Tuple, Callable, Union, Any
 import json
 import os
 import hashlib
@@ -87,17 +87,19 @@ For full documentation, see docs/tmux-cli-instructions.md in the package reposit
 
 
 class TmuxCLIController:
-    """Controller for interacting with CLI applications in tmux windows."""
+    """Controller for interacting with CLI applications in tmux panes."""
     
-    def __init__(self, session_name: Optional[str] = None):
+    def __init__(self, session_name: Optional[str] = None, window_name: Optional[str] = None):
         """
         Initialize the controller.
-
+        
         Args:
             session_name: Name of tmux session (defaults to current)
+            window_name: Name of tmux window (defaults to current)
         """
         self.session_name = session_name
-        self.target_window = None
+        self.window_name = window_name
+        self.target_pane = None
     
     def _run_tmux_command(self, command: List[str]) -> Tuple[str, int]:
         """
@@ -141,6 +143,70 @@ class TmuxCLIController:
         output, code = self._run_tmux_command(['display-message', '-t', pane_id, '-p', '#{pane_current_command}'])
         return output if code == 0 else None
     
+    def format_pane_identifier(self, pane_id: str) -> str:
+        """Convert pane ID to session:window.pane format."""
+        # Validate pane_id is not empty
+        if not pane_id:
+            return pane_id
+
+        try:
+            # Get session, window index, and pane index for this pane
+            session_output, session_code = self._run_tmux_command(['display-message', '-t', pane_id, '-p', '#{session_name}'])
+            window_output, window_code = self._run_tmux_command(['display-message', '-t', pane_id, '-p', '#{window_index}'])
+            pane_output, pane_code = self._run_tmux_command(['display-message', '-t', pane_id, '-p', '#{pane_index}'])
+
+            # Check both return codes AND that outputs are non-empty
+            if (session_code == 0 and window_code == 0 and pane_code == 0 and
+                session_output and window_output and pane_output):
+                return f"{session_output}:{window_output}.{pane_output}"
+            else:
+                # Fallback to pane ID
+                return pane_id
+        except:
+            return pane_id
+    
+    def resolve_pane_identifier(self, identifier: str) -> Optional[str]:
+        """Convert various pane identifier formats to pane ID.
+        
+        Supports:
+        - Pane IDs: %123
+        - session:window.pane: mysession:1.2
+        - Just pane index: 2 (for current window)
+        """
+        if not identifier:
+            return None
+        
+        # Convert to string if it's a number
+        identifier = str(identifier)
+            
+        # If it's already a pane ID (%123), return as is
+        if identifier.startswith('%'):
+            return identifier
+            
+        # If it's just a number, treat as pane index in current window
+        if identifier.isdigit():
+            panes = self.list_panes()
+            for pane in panes:
+                if pane['index'] == identifier:
+                    return pane['id']
+            return None
+            
+        # If it's session:window.pane format
+        if ':' in identifier and '.' in identifier:
+            try:
+                session_window, pane_index = identifier.rsplit('.', 1)
+                session, window = session_window.split(':', 1)
+                
+                # Get pane ID from session:window.pane
+                output, code = self._run_tmux_command([
+                    'display-message', '-t', f'{session}:{window}.{pane_index}', '-p', '#{pane_id}'
+                ])
+                return output if code == 0 else None
+            except:
+                return None
+                
+        return None
+    
     def get_current_window_id(self) -> Optional[str]:
         """Get the ID of the current tmux window."""
         # Use TMUX_PANE environment variable to get the pane we're running in
@@ -154,322 +220,475 @@ class TmuxCLIController:
         output, code = self._run_tmux_command(['display-message', '-p', '#{window_id}'])
         return output if code == 0 else None
     
-    # Window-based operations
-
-    def generate_window_name(self, custom_name: Optional[str] = None) -> str:
+    def list_panes(self) -> List[Dict[str, str]]:
         """
-        Generate a unique window name with tmux-cli prefix.
-
-        Args:
-            custom_name: Optional custom name (will be prefixed with tmux-cli-)
+        List all panes in the current window.
 
         Returns:
-            Unique window name like 'tmux-cli-1730559234-123' or 'tmux-cli-custom-name'
+            List of dicts with pane info (id, index, title, active, size, command, formatted_id)
         """
-        prefix = "tmux-cli"
+        # Use explicit target if provided
+        if self.session_name and self.window_name:
+            target = f"{self.session_name}:{self.window_name}"
+        else:
+            # Use the window where the command is being executed from
+            target = self.get_current_window_id()
 
-        if custom_name:
-            # Ensure custom names also have the prefix for tracking
-            if not custom_name.startswith(prefix + "-"):
-                return f"{prefix}-{custom_name}"
-            return custom_name
-
-        # Generate timestamp-based name
-        timestamp = int(time.time())
-        # Add a small random component to handle rapid consecutive calls
-        import random
-        rand_suffix = random.randint(0, 999)
-        return f"{prefix}-{timestamp}-{rand_suffix}"
-
-    def create_window(self, start_command: Optional[str] = None,
-                     window_name: Optional[str] = None) -> Optional[str]:
-        """
-        Create a new window in the current session with tmux-cli prefix.
-
-        Args:
-            start_command: Command to run in the new window
-            window_name: Custom window name (will be prefixed with 'tmux-cli-')
-                        If not provided, generates timestamp-based name
-
-        Returns:
-            Window name of the created window (always starts with 'tmux-cli-')
-        """
-        # Get current session
-        session = self.session_name or self.get_current_session()
-        if not session:
-            return None
-
-        # Generate name with tmux-cli prefix
-        name = self.generate_window_name(window_name)
-
-        # Create window with unique name in the background (don't switch focus)
-        cmd = ['new-window', '-d', '-t', session, '-n', name, '-P', '-F', '#{window_name}']
-
-        if start_command:
-            cmd.append(start_command)
-
-        output, code = self._run_tmux_command(cmd)
-
-        if code == 0:
-            self.target_window = output
-            return output
-        return None
-
-    def resolve_window_identifier(self, identifier: str) -> Optional[str]:
-        """
-        Convert window identifier to a tmux target.
-
-        Supports:
-        - Window IDs: @123 (most stable)
-        - Window names: tmux-cli-12345
-        - session:window format: mysession:tmux-cli-12345
-        - Index (legacy): 2
-
-        Returns:
-            Tmux target string or None
-        """
-        if not identifier:
-            return None
-
-        # Convert to string if it's a number
-        identifier = str(identifier)
-
-        # Window ID format (@N) - most stable, use as-is
-        if identifier.startswith('@'):
-            return identifier
-
-        # Full format with session
-        if ':' in identifier:
-            return identifier
-
-        # Get current session for relative references
-        session = self.session_name or self.get_current_session()
-        if not session:
-            return None
-
-        # Check if it's a window name by listing windows
-        output, code = self._run_tmux_command([
-            'list-windows', '-t', session,
-            '-F', '#{window_name}|#{window_id}'
-        ])
-
-        if code == 0 and output:
-            for line in output.split('\n'):
-                if line:
-                    parts = line.split('|')
-                    if len(parts) == 2:
-                        win_name, win_id = parts
-                        if win_name == identifier:
-                            return f'{session}:{win_name}'
-
-        # Legacy: treat as index
-        if identifier.isdigit():
-            return f'{session}:{identifier}'
-
-        return None
-
-    def list_windows(self) -> List[Dict[str, str]]:
-        """
-        List all windows in the current session.
-
-        Returns:
-            List of dicts with window info (id, index, name, active)
-        """
-        session = self.session_name or self.get_current_session()
-        if not session:
-            return []
-
-        output, code = self._run_tmux_command([
-            'list-windows', '-t', session,
-            '-F', '#{window_id}|#{window_index}|#{window_name}|#{window_active}|#{pane_current_command}'
-        ])
-
+        if target:
+            output, code = self._run_tmux_command([
+                'list-panes',
+                '-t', target,
+                '-F', '#{pane_id}|#{pane_index}|#{pane_title}|#{pane_active}|#{pane_width}x#{pane_height}|#{pane_current_command}'
+            ])
+        else:
+            # Fallback to default behavior
+            output, code = self._run_tmux_command([
+                'list-panes',
+                '-F', '#{pane_id}|#{pane_index}|#{pane_title}|#{pane_active}|#{pane_width}x#{pane_height}|#{pane_current_command}'
+            ])
+        
         if code != 0:
             return []
-
-        windows = []
+        
+        panes = []
         for line in output.split('\n'):
             if line:
                 parts = line.split('|')
-                if len(parts) >= 4:
-                    windows.append({
-                        'id': parts[0],
-                        'index': parts[1],
-                        'name': parts[2],
-                        'active': parts[3] == '1',
-                        'command': parts[4] if len(parts) > 4 else ''
-                    })
-        return windows
-
-    def list_tmux_cli_windows(self) -> List[Dict[str, str]]:
+                pane_id = parts[0]
+                panes.append({
+                    'id': pane_id,
+                    'index': parts[1],
+                    'title': parts[2],
+                    'active': parts[3] == '1',
+                    'size': parts[4],
+                    'command': parts[5] if len(parts) > 5 else '',
+                    'formatted_id': self.format_pane_identifier(pane_id)
+                })
+        return panes
+    
+    def create_pane(self, vertical: bool = True, size: Optional[int] = None, 
+                   start_command: Optional[str] = None) -> Optional[str]:
         """
-        List all windows created by tmux-cli (by name prefix).
-
-        Returns:
-            List of dicts with window info
-        """
-        all_windows = self.list_windows()
-        return [w for w in all_windows if w['name'].startswith('tmux-cli-')]
-
-    def kill_window(self, window_id: Optional[str] = None):
-        """
-        Kill a window.
-
+        Create a new pane in the current window.
+        
         Args:
-            window_id: Target window (name, @id, or index)
+            vertical: If True, split vertically (side by side), else horizontally
+            size: Size percentage for the new pane (e.g., 50 for 50%)
+            start_command: Command to run in the new pane
+            
+        Returns:
+            Pane ID of the created pane
         """
-        target = window_id or self.target_window
-        if not target:
-            raise ValueError("No target window specified")
+        # Get the current window ID to ensure pane is created in this window
+        current_window_id = self.get_current_window_id()
 
-        # Resolve to tmux target
-        resolved = self.resolve_window_identifier(target)
-        if not resolved:
-            resolved = target  # Try the original if resolution failed
+        # Build base command
+        base_cmd = ['split-window']
 
-        self._run_tmux_command(['kill-window', '-t', resolved])
+        # Target the specific window where tmux-cli was called from
+        if current_window_id:
+            base_cmd.extend(['-t', current_window_id])
 
-        if target == self.target_window:
-            self.target_window = None
+        if vertical:
+            base_cmd.append('-h')
+        else:
+            base_cmd.append('-v')
 
-    def cleanup_all_windows(self):
+        # Get list of existing panes BEFORE creating new one (for verification)
+        existing_panes = {p['id'] for p in self.list_panes()}
+
+        # Try -l first (tmux 3.4+), fall back to -p (older versions)
+        # tmux 3.4 removed -p, but 3.5+ has both; older versions only have -p
+        for size_flag in (['-l', f'{size}%'], ['-p', str(size)]) if size else [[]]:
+            cmd = base_cmd.copy()
+            if size_flag:
+                cmd.extend(size_flag)
+            cmd.extend(['-P', '-F', '#{pane_id}'])
+            if start_command:
+                cmd.append(start_command)
+
+            output, code = self._run_tmux_command(cmd)
+
+            # Validate: code must be 0 and output must be a valid pane ID (starts with %)
+            if code == 0 and output and output.startswith('%'):
+                # Verify the pane actually exists by querying it
+                verify_output, verify_code = self._run_tmux_command(
+                    ['display-message', '-t', output, '-p', '#{pane_id}']
+                )
+                if verify_code == 0 and verify_output == output:
+                    self.target_pane = output
+                    return output
+
+                # Pane ID mismatch - find the actual new pane.
+                # This can occur when tmux reports a stale pane ID (e.g., from a
+                # recently killed pane) or during rapid pane creation/destruction.
+                current_panes = {p['id'] for p in self.list_panes()}
+                new_panes = current_panes - existing_panes
+                if new_panes:
+                    # Use min() for deterministic selection if multiple panes created
+                    actual_pane = min(new_panes)
+                    self.target_pane = actual_pane
+                    return actual_pane
+
+        return None
+    
+    def select_pane(self, pane_id: Optional[str] = None, pane_index: Optional[int] = None):
         """
-        Kill all tmux-cli created windows.
+        Select a pane as the target for operations.
+        
+        Args:
+            pane_id: Pane ID (e.g., %0, %1)
+            pane_index: Pane index (0-based)
         """
-        windows = self.list_tmux_cli_windows()
-        for window in windows:
-            try:
-                self._run_tmux_command(['kill-window', '-t', window['id']])
-            except:
-                pass  # Continue cleanup even if one fails
-
-    def send_keys_to_window(self, text: str, window_id: Optional[str] = None,
-                           enter: bool = True, delay_enter: Union[bool, float] = True):
+        if pane_id:
+            self.target_pane = pane_id
+        elif pane_index is not None:
+            panes = self.list_panes()
+            for pane in panes:
+                if int(pane['index']) == pane_index:
+                    self.target_pane = pane['id']
+                    break
+    
+    def send_keys(self, text: str, pane_id: Optional[str] = None, enter: bool = True,
+                  delay_enter: Union[bool, float] = True, verify_enter: bool = True,
+                  max_retries: int = 3):
         """
-        Send keystrokes to a window (to its active pane).
+        Send keystrokes to a pane with optional Enter key verification.
 
         Args:
             text: Text to send
-            window_id: Target window (uses self.target_window if not specified)
+            pane_id: Target pane (uses self.target_pane if not specified)
             enter: Whether to send Enter key after text
-            delay_enter: If True, use 1.0s delay; if float, use that delay in seconds
+            delay_enter: If True, use 1.5s delay; if float, use that delay in seconds (default: True)
+            verify_enter: If True, verify Enter was received and retry if not (default: True)
+            max_retries: Maximum number of Enter key retries (default: 3)
         """
-        target = window_id or self.target_window
+        target = pane_id or self.target_pane
         if not target:
-            raise ValueError("No target window specified")
-
-        # Resolve to tmux target
-        resolved = self.resolve_window_identifier(target)
-        if not resolved:
-            resolved = target
+            raise ValueError("No target pane specified")
 
         if enter and delay_enter:
             # Send text without Enter first
-            cmd = ['send-keys', '-t', resolved, text]
+            cmd = ['send-keys', '-t', target, text]
             self._run_tmux_command(cmd)
 
             # Determine delay duration
             if isinstance(delay_enter, bool):
-                delay = 1.0
+                delay = 1.5  # Default delay
             else:
                 delay = float(delay_enter)
 
             # Apply delay
             time.sleep(delay)
 
-            # Then send just Enter
-            cmd = ['send-keys', '-t', resolved, 'Enter']
-            self._run_tmux_command(cmd)
+            # Capture pane state AFTER text is sent but BEFORE Enter
+            # This ensures we detect changes caused by Enter, not by the text itself
+            content_before_enter = self.capture_pane(target, lines=20) if verify_enter else None
+
+            # Send Enter with verification and retry logic
+            self._send_enter_with_retry(target, content_before_enter, verify_enter, max_retries)
         else:
-            cmd = ['send-keys', '-t', resolved, text]
+            # Original behavior (no delay)
+            cmd = ['send-keys', '-t', target, text]
             if enter:
                 cmd.append('Enter')
             self._run_tmux_command(cmd)
 
-    def capture_window(self, window_id: Optional[str] = None, lines: Optional[int] = None) -> str:
+    def _send_enter_with_retry(self, target: str, content_before_enter: Optional[str],
+                                verify: bool, max_retries: int):
         """
-        Capture the contents of a window (its active pane).
+        Send Enter key with optional verification and retry.
+
+        Verifies that Enter was received by checking if pane content changed
+        (indicating command was submitted). Retries if content hasn't changed.
 
         Args:
-            window_id: Target window (uses self.target_window if not specified)
-            lines: Number of lines to capture from bottom (captures all if None)
+            target: Target pane ID
+            content_before_enter: Pane content captured after text but before Enter
+            verify: Whether to verify Enter was received
+            max_retries: Maximum retry attempts
+        """
+        for attempt in range(max_retries):
+            # Send Enter
+            cmd = ['send-keys', '-t', target, 'Enter']
+            self._run_tmux_command(cmd)
 
+            if not verify or content_before_enter is None:
+                return  # No verification needed
+
+            # Wait a bit for the command to process
+            time.sleep(0.3)
+
+            # Check if pane content changed (indicating Enter was received)
+            content_after = self.capture_pane(target, lines=20)
+
+            if content_after != content_before_enter:
+                # Content changed - Enter was successful
+                return
+
+            # Content unchanged - Enter may not have been received
+            if attempt < max_retries - 1:
+                # Wait before retry (exponential backoff)
+                time.sleep(0.5 * (attempt + 1))
+    
+    def capture_pane(self, pane_id: Optional[str] = None, lines: Optional[int] = None) -> str:
+        """
+        Capture the contents of a pane.
+        
+        Args:
+            pane_id: Target pane (uses self.target_pane if not specified)
+            lines: Number of lines to capture from bottom (captures all if None)
+            
         Returns:
             Captured text content
         """
-        target = window_id or self.target_window
+        target = pane_id or self.target_pane
         if not target:
-            raise ValueError("No target window specified")
-
-        # Resolve to tmux target
-        resolved = self.resolve_window_identifier(target)
-        if not resolved:
-            resolved = target
-
-        cmd = ['capture-pane', '-t', resolved, '-p']
-
+            raise ValueError("No target pane specified")
+        
+        cmd = ['capture-pane', '-t', target, '-p']
+        
         if lines:
             cmd.extend(['-S', f'-{lines}'])
-
+        
         output, _ = self._run_tmux_command(cmd)
         return output
-
-    def wait_for_idle(self, window_id: Optional[str] = None, idle_time: float = 3.0,
+    
+    def wait_for_prompt(self, prompt_pattern: str, pane_id: Optional[str] = None, 
+                       timeout: int = 10, check_interval: float = 0.5) -> bool:
+        """
+        Wait for a specific prompt pattern to appear in the pane.
+        
+        Args:
+            prompt_pattern: Regex pattern to match
+            pane_id: Target pane
+            timeout: Maximum seconds to wait
+            check_interval: Seconds between checks
+            
+        Returns:
+            True if prompt found, False if timeout
+        """
+        target = pane_id or self.target_pane
+        if not target:
+            raise ValueError("No target pane specified")
+        
+        pattern = re.compile(prompt_pattern)
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            content = self.capture_pane(target, lines=50)
+            if pattern.search(content):
+                return True
+            time.sleep(check_interval)
+        
+        return False
+    
+    def wait_for_idle(self, pane_id: Optional[str] = None, idle_time: float = 2.0,
                      check_interval: float = 0.5, timeout: Optional[int] = None) -> bool:
         """
-        Wait for a window to become idle (no output changes for idle_time seconds).
-
+        Wait for a pane to become idle (no output changes for idle_time seconds).
+        
         Args:
-            window_id: Target window
+            pane_id: Target pane
             idle_time: Seconds of no change to consider idle
             check_interval: Seconds between checks
             timeout: Maximum seconds to wait (None for no timeout)
-
+            
         Returns:
             True if idle detected, False if timeout
         """
-        target = window_id or self.target_window
+        target = pane_id or self.target_pane
         if not target:
-            raise ValueError("No target window specified")
-
+            raise ValueError("No target pane specified")
+        
         start_time = time.time()
         last_change_time = time.time()
         last_hash = ""
-
+        
         while True:
             if timeout and (time.time() - start_time > timeout):
                 return False
-
-            content = self.capture_window(target)
+                
+            content = self.capture_pane(target)
             content_hash = hashlib.md5(content.encode()).hexdigest()
-
+            
             if content_hash != last_hash:
                 last_hash = content_hash
                 last_change_time = time.time()
             elif time.time() - last_change_time >= idle_time:
                 return True
-
+                
             time.sleep(check_interval)
-
-    def launch_cli(self, command: str, window_name: Optional[str] = None) -> Optional[str]:
+    
+    def kill_pane(self, pane_id: Optional[str] = None):
         """
-        Launch a CLI application in a new window.
+        Kill a pane.
+        
+        Args:
+            pane_id: Target pane (uses self.target_pane if not specified)
+        """
+        target = pane_id or self.target_pane
+        if not target:
+            raise ValueError("No target pane specified")
+        
+        # Safety check: prevent killing own pane ONLY when explicitly specified
+        # If using target_pane (a pane we created), it should be safe to kill
+        if pane_id is not None:  # Only check when pane_id was explicitly provided
+            current_pane = self.get_current_pane()
+            if current_pane and target == current_pane:
+                raise ValueError("Error: Cannot kill own pane! This would terminate your session.")
+        
+        self._run_tmux_command(['kill-pane', '-t', target])
+        
+        if target == self.target_pane:
+            self.target_pane = None
+    
+    def resize_pane(self, direction: str, amount: int = 5, pane_id: Optional[str] = None):
+        """
+        Resize a pane.
+        
+        Args:
+            direction: One of 'up', 'down', 'left', 'right'
+            amount: Number of cells to resize
+            pane_id: Target pane
+        """
+        target = pane_id or self.target_pane
+        if not target:
+            raise ValueError("No target pane specified")
+        
+        direction_map = {
+            'up': '-U',
+            'down': '-D',
+            'left': '-L',
+            'right': '-R'
+        }
+        
+        if direction not in direction_map:
+            raise ValueError(f"Invalid direction: {direction}")
+        
+        self._run_tmux_command(['resize-pane', '-t', target, direction_map[direction], str(amount)])
+    
+    def focus_pane(self, pane_id: Optional[str] = None):
+        """
+        Focus (select) a pane.
+        
+        Args:
+            pane_id: Target pane
+        """
+        target = pane_id or self.target_pane
+        if not target:
+            raise ValueError("No target pane specified")
+        
+        self._run_tmux_command(['select-pane', '-t', target])
+    
+    def send_interrupt(self, pane_id: Optional[str] = None):
+        """
+        Send Ctrl+C to a pane.
+        
+        Args:
+            pane_id: Target pane
+        """
+        target = pane_id or self.target_pane
+        if not target:
+            raise ValueError("No target pane specified")
+        
+        self._run_tmux_command(['send-keys', '-t', target, 'C-c'])
+    
+    def send_escape(self, pane_id: Optional[str] = None):
+        """
+        Send Escape key to a pane.
+        
+        Args:
+            pane_id: Target pane
+        """
+        target = pane_id or self.target_pane
+        if not target:
+            raise ValueError("No target pane specified")
+        
+        self._run_tmux_command(['send-keys', '-t', target, 'Escape'])
+    
+    def clear_pane(self, pane_id: Optional[str] = None):
+        """
+        Clear the pane screen.
 
         Args:
-            command: Command to launch
-            window_name: Custom window name (will be prefixed with 'tmux-cli-')
+            pane_id: Target pane
+        """
+        target = pane_id or self.target_pane
+        if not target:
+            raise ValueError("No target pane specified")
+
+        self._run_tmux_command(['send-keys', '-t', target, 'C-l'])
+
+    def execute(self, command: str, pane_id: Optional[str] = None, timeout: int = 30) -> Dict[str, Any]:
+        """
+        Execute a command and return output with exit code.
+
+        Uses unique markers to capture the command's exit status reliably.
+
+        Args:
+            command: Shell command to execute
+            pane_id: Target pane (uses self.target_pane if not specified)
+            timeout: Maximum seconds to wait for completion (default: 30)
 
         Returns:
-            Window name starting with 'tmux-cli-'
+            Dict with keys:
+                - output (str): Command output (stdout + stderr)
+                - exit_code (int): Command exit status, or -1 on timeout
+
+        Raises:
+            ValueError: If no target pane specified
         """
-        return self.create_window(start_command=command, window_name=window_name)
+        from .tmux_execution_helpers import (
+            generate_execution_markers,
+            wrap_command_with_markers,
+            poll_for_completion,
+        )
+
+        target = pane_id or self.target_pane
+        if not target:
+            raise ValueError("No target pane specified")
+
+        # Generate unique markers for this execution
+        start_marker, end_marker = generate_execution_markers()
+
+        # Wrap command with markers
+        wrapped_command = wrap_command_with_markers(command, start_marker, end_marker)
+
+        # Send wrapped command to pane
+        self.send_keys(wrapped_command, pane_id=target, enter=True, delay_enter=False)
+
+        # Poll for completion with progressive expansion
+        return poll_for_completion(
+            capture_fn=lambda lines: self.capture_pane(pane_id=target, lines=lines),
+            start_marker=start_marker,
+            end_marker=end_marker,
+            timeout=timeout,
+        )
+
+    def launch_cli(self, command: str, vertical: bool = True, size: int = 50) -> Optional[str]:
+        """
+        Convenience method to launch a CLI application in a new pane.
+        
+        Args:
+            command: Command to launch
+            vertical: Split direction
+            size: Pane size percentage
+            
+        Returns:
+            Formatted pane identifier (session:window.pane) of the created pane
+        """
+        pane_id = self.create_pane(vertical=vertical, size=size, start_command=command)
+        if pane_id:
+            return self.format_pane_identifier(pane_id)
+        return None
 
 
 class CLI:
     """Unified CLI interface that auto-detects tmux environment.
-
+    
     Automatically uses:
-    - TmuxCLIController when inside tmux (for window management)
+    - TmuxCLIController when inside tmux (for pane management)
     - RemoteTmuxController when outside tmux (for window management)
     """
     
@@ -493,209 +712,226 @@ class CLI:
             self.mode = 'remote'
     
     def status(self):
-        """Show current tmux status and tmux-cli managed windows."""
+        """Show current tmux status and pane information."""
         if not self.in_tmux:
             print("Not currently in tmux")
             if hasattr(self.controller, 'session_name'):
                 print(f"Remote session: {self.controller.session_name}")
             return
 
-        # Get current location
-        session = self.controller.get_current_session()
-        window = self.controller.get_current_window()
+        # Use TMUX_PANE to get location where this process is running,
+        # not the currently focused pane. This is consistent with where
+        # list_panes() and create_pane() operate.
+        tmux_pane = os.environ.get('TMUX_PANE')
+        if tmux_pane:
+            session, session_code = self.controller._run_tmux_command(
+                ['display-message', '-t', tmux_pane, '-p', '#{session_name}'])
+            window, window_code = self.controller._run_tmux_command(
+                ['display-message', '-t', tmux_pane, '-p', '#{window_name}'])
+            pane_index, pane_code = self.controller._run_tmux_command(
+                ['display-message', '-t', tmux_pane, '-p', '#{pane_index}'])
+            # If any command failed, fall back to None so the error message shows
+            if session_code != 0 or window_code != 0 or pane_code != 0:
+                session = window = pane_index = None
+        else:
+            # Fallback if TMUX_PANE not set
+            session = self.controller.get_current_session()
+            window = self.controller.get_current_window()
+            pane_index = self.controller.get_current_pane_index()
 
-        if session and window:
-            print(f"Current location: {session}:{window}")
+        if session and window and pane_index:
+            print(f"Current location: {session}:{window}.{pane_index}")
         else:
             print("Could not determine current tmux location")
-
-        # List tmux-cli managed windows
-        tmux_cli_windows = self.controller.list_tmux_cli_windows()
-        if tmux_cli_windows:
-            print(f"\ntmux-cli managed windows:")
-            for win in tmux_cli_windows:
-                active_marker = " *" if win['active'] else "  "
-                command = win.get('command', '')
-                print(f"{active_marker} {win['name']:30} {command:20}")
-
-        # List all windows in session
-        all_windows = self.controller.list_windows()
-        if all_windows:
-            print(f"\nAll windows in session:")
-            for win in all_windows:
-                active_marker = " *" if win['active'] else "  "
-                command = win.get('command', '')
-                print(f"{active_marker} {win['index']:3} {win['name']:30} {command:20}")
+            
+        # List all panes in current window
+        panes = self.controller.list_panes()
+        if panes:
+            print(f"\nPanes in current window:")
+            for pane in panes:
+                active_marker = " *" if pane['active'] else "  "
+                command = pane.get('command', '')
+                title = pane.get('title', '')
+                print(f"{active_marker} {pane['formatted_id']:15} {command:20} {title}")
+        else:
+            print("\nNo panes found")
     
-    def launch(self, command: str, window_name: Optional[str] = None):
-        """Launch a command in a new window.
-
+    def list_panes(self):
+        """List all panes in current window."""
+        panes = self.controller.list_panes()
+        print(json.dumps(panes, indent=2))
+    
+    def launch(self, command: str, vertical: bool = True, size: int = 50, name: Optional[str] = None):
+        """Launch a command in a new pane/window.
+        
         Args:
             command: Command to launch
-            window_name: Custom window name (will be prefixed with 'tmux-cli-')
+            vertical: Split direction (only used in local mode)
+            size: Pane size percentage (only used in local mode)
+            name: Window name (only used in remote mode)
         """
         if self.mode == 'local':
-            identifier = self.controller.launch_cli(command, window_name=window_name)
-            print(f"Launched '{command}' in window: {identifier}")
+            pane_id = self.controller.launch_cli(command, vertical=vertical, size=size)
+            print(f"Launched '{command}' in pane {pane_id}")
         else:
             # Remote mode
-            # Remote controller uses 'name' parameter
-            from .tmux_remote_controller import RemoteTmuxController
-            if isinstance(self.controller, RemoteTmuxController):
-                identifier = self.controller.launch_cli(command, name=window_name)
-            else:
-                identifier = self.controller.launch_cli(command, window_name=window_name)
-            print(f"Launched '{command}' in window: {identifier}")
-        return identifier
+            pane_id = self.controller.launch_cli(command, name=name)
+            print(f"Launched '{command}' in window: {pane_id}")
+        return pane_id
     
-    def send(self, text: str, window_name: Optional[str] = None,
-             enter: bool = True, delay_enter: Union[bool, float] = True):
-        """Send text to a window.
+    def send(self, text: str, pane: Optional[str] = None, enter: bool = True,
+             delay_enter: Union[bool, float] = True):
+        """Send text to a pane.
 
         Args:
             text: Text to send
-            window_name: Target window name
+            pane: Target pane (session:window.pane, %id, or just index)
             enter: Whether to send Enter key after text
-            delay_enter: If True, use 1.0s delay; if float, use that delay in seconds
+            delay_enter: If True, use 1.5s delay; if float, use that delay in seconds (default: True)
         """
         if self.mode == 'local':
-            if window_name:
-                resolved = self.controller.resolve_window_identifier(window_name)
-                if not resolved:
-                    print(f"Could not resolve window: {window_name}")
+            # Local mode - resolve pane identifier
+            if pane:
+                resolved_pane = self.controller.resolve_pane_identifier(pane)
+                if resolved_pane:
+                    self.controller.select_pane(pane_id=resolved_pane)
+                else:
+                    print(f"Could not resolve pane identifier: {pane}")
                     return
-                self.controller.send_keys_to_window(text, window_id=resolved,
-                                                   enter=enter, delay_enter=delay_enter)
-            else:
-                self.controller.send_keys_to_window(text, enter=enter, delay_enter=delay_enter)
+            self.controller.send_keys(text, enter=enter, delay_enter=delay_enter)
         else:
-            # Remote mode
-            self.controller.send_keys(text, pane_id=window_name, enter=enter, delay_enter=delay_enter)
+            # Remote mode - pass pane_id directly
+            self.controller.send_keys(text, pane_id=pane, enter=enter,
+                                    delay_enter=delay_enter)
         print("Text sent")
     
-    def capture(self, window_name: Optional[str] = None, lines: Optional[int] = None):
-        """Capture window content.
-
-        Args:
-            window_name: Target window identifier (window name)
-            lines: Number of lines to capture from bottom
-        """
+    def capture(self, pane: Optional[str] = None, lines: Optional[int] = None):
+        """Capture and print pane content."""
         if self.mode == 'local':
-            if window_name:
-                resolved = self.controller.resolve_window_identifier(window_name)
-                if not resolved:
-                    print(f"Could not resolve window: {window_name}")
+            # Local mode - resolve pane identifier
+            if pane:
+                resolved_pane = self.controller.resolve_pane_identifier(pane)
+                if resolved_pane:
+                    self.controller.select_pane(pane_id=resolved_pane)
+                else:
+                    print(f"Could not resolve pane identifier: {pane}")
                     return ""
-                content = self.controller.capture_window(window_id=resolved, lines=lines)
-            else:
-                content = self.controller.capture_window(lines=lines)
+            content = self.controller.capture_pane(lines=lines)
         else:
-            # Remote mode
-            content = self.controller.capture_pane(pane_id=window_name, lines=lines)
+            # Remote mode - pass pane_id directly
+            content = self.controller.capture_pane(pane_id=pane, lines=lines)
         return content
-    
-    def interrupt(self, window_name: Optional[str] = None):
-        """Send Ctrl+C to a window.
+
+    def execute(self, command: str, pane: Optional[str] = None, timeout: int = 30):
+        """Execute command and return structured output with exit code.
 
         Args:
-            window_name: Target window identifier (window name)
+            command: Shell command to execute
+            pane: Target pane identifier (session:window.pane, %id, or index)
+            timeout: Maximum seconds to wait (default: 30)
         """
         if self.mode == 'local':
-            if window_name:
-                resolved = self.controller.resolve_window_identifier(window_name)
-                if not resolved:
-                    print(f"Could not resolve window: {window_name}")
+            # Local mode - resolve pane identifier
+            if pane:
+                resolved_pane = self.controller.resolve_pane_identifier(pane)
+                if not resolved_pane:
+                    print(f"Could not resolve pane identifier: {pane}")
                     return
-                self.controller._run_tmux_command(['send-keys', '-t', resolved, 'C-c'])
             else:
-                self.controller._run_tmux_command(['send-keys', '-t', self.controller.target_window, 'C-c'])
+                resolved_pane = None
+
+            result = self.controller.execute(command, pane_id=resolved_pane, timeout=timeout)
         else:
-            # Remote mode
-            target_id = self.controller._resolve_pane_id(window_name)
-            self.controller.send_interrupt(pane_id=target_id)
+            # Remote mode - pass pane directly
+            result = self.controller.execute(command, pane_id=pane, timeout=timeout)
+
+        # Print JSON for easy parsing
+        print(json.dumps(result, indent=2))
+        return result
+
+    def interrupt(self, pane: Optional[str] = None):
+        """Send Ctrl+C to a pane."""
+        if self.mode == 'local':
+            # Local mode - resolve pane identifier
+            if pane:
+                resolved_pane = self.controller.resolve_pane_identifier(pane)
+                if resolved_pane:
+                    self.controller.select_pane(pane_id=resolved_pane)
+                else:
+                    print(f"Could not resolve pane identifier: {pane}")
+                    return
+            self.controller.send_interrupt()
+        else:
+            # Remote mode - resolve and pass pane_id
+            target = self.controller._resolve_pane_id(pane)
+            self.controller.send_interrupt(pane_id=target)
         print("Sent interrupt signal")
-
-    def escape(self, window_name: Optional[str] = None):
-        """Send Escape key to a window.
-
-        Args:
-            window_name: Target window identifier (window name)
-        """
+    
+    def escape(self, pane: Optional[str] = None):
+        """Send Escape key to a pane."""
         if self.mode == 'local':
-            if window_name:
-                resolved = self.controller.resolve_window_identifier(window_name)
-                if not resolved:
-                    print(f"Could not resolve window: {window_name}")
+            # Local mode - resolve pane identifier
+            if pane:
+                resolved_pane = self.controller.resolve_pane_identifier(pane)
+                if resolved_pane:
+                    self.controller.select_pane(pane_id=resolved_pane)
+                else:
+                    print(f"Could not resolve pane identifier: {pane}")
                     return
-                self.controller._run_tmux_command(['send-keys', '-t', resolved, 'Escape'])
-            else:
-                self.controller._run_tmux_command(['send-keys', '-t', self.controller.target_window, 'Escape'])
+            self.controller.send_escape()
         else:
-            # Remote mode
-            target_id = self.controller._resolve_pane_id(window_name)
-            self.controller.send_escape(pane_id=target_id)
+            # Remote mode - resolve and pass pane_id
+            target = self.controller._resolve_pane_id(pane)
+            self.controller.send_escape(pane_id=target)
         print("Sent escape key")
-
-    def kill(self, window_name: Optional[str] = None):
-        """Kill a window.
-
-        Args:
-            window_name: Target window identifier (window name)
-        """
+    
+    def kill(self, pane: Optional[str] = None):
+        """Kill a pane/window."""
         if self.mode == 'local':
-            if window_name:
-                resolved = self.controller.resolve_window_identifier(window_name)
-                if not resolved:
-                    print(f"Could not resolve window: {window_name}")
+            # Local mode - kill pane
+            if pane:
+                resolved_pane = self.controller.resolve_pane_identifier(pane)
+                if resolved_pane:
+                    self.controller.select_pane(pane_id=resolved_pane)
+                else:
+                    print(f"Could not resolve pane identifier: {pane}")
                     return
-                try:
-                    self.controller.kill_window(window_id=window_name)
-                    print(f"Window '{window_name}' killed")
-                except ValueError as e:
-                    print(str(e))
-            else:
-                try:
-                    self.controller.kill_window()
-                    print("Window killed")
-                except ValueError as e:
-                    print(str(e))
-        else:
-            # Remote mode
             try:
-                self.controller.kill_window(window_id=window_name)
+                self.controller.kill_pane()
+                print("Pane killed")
+            except ValueError as e:
+                print(str(e))
+        else:
+            # Remote mode - kill window
+            try:
+                self.controller.kill_window(window_id=pane)
                 print("Window killed")
             except ValueError as e:
                 print(str(e))
     
-    def wait_idle(self, window_name: Optional[str] = None, idle_time: float = 3.0,
+    def wait_idle(self, pane: Optional[str] = None, idle_time: float = 2.0, 
                   timeout: Optional[int] = None):
-        """Wait for window to become idle (no output changes).
-
-        Args:
-            window_name: Target window name
-            idle_time: Seconds of no change to consider idle
-            timeout: Maximum seconds to wait
-        """
+        """Wait for pane to become idle (no output changes)."""
         if self.mode == 'local':
-            if window_name:
-                resolved = self.controller.resolve_window_identifier(window_name)
-                if not resolved:
-                    print(f"Could not resolve window: {window_name}")
+            # Local mode - resolve pane identifier
+            if pane:
+                resolved_pane = self.controller.resolve_pane_identifier(pane)
+                if resolved_pane:
+                    self.controller.select_pane(pane_id=resolved_pane)
+                else:
+                    print(f"Could not resolve pane identifier: {pane}")
                     return False
-                target = window_name
-            else:
-                target = None
-
-            print(f"Waiting for window to become idle (no changes for {idle_time}s)...")
-            if self.controller.wait_for_idle(window_id=target, idle_time=idle_time, timeout=timeout):
-                print("Window is idle")
-                return True
-            else:
-                print("Timeout waiting for idle")
-                return False
+            target = None
         else:
-            # Remote mode
-            print("wait_idle not supported in remote mode")
+            # Remote mode - resolve pane_id
+            target = self.controller._resolve_pane_id(pane)
+        
+        print(f"Waiting for pane to become idle (no changes for {idle_time}s)...")
+        if self.controller.wait_for_idle(pane_id=target, idle_time=idle_time, timeout=timeout):
+            print("Pane is idle")
+            return True
+        else:
+            print("Timeout waiting for idle")
             return False
     
     def attach(self):
@@ -704,49 +940,29 @@ class CLI:
             print("Attach is only available in remote mode (when outside tmux)")
             return
         self.controller.attach_session()
-
-    def list_windows(self):
-        """List all windows in the current session."""
-        if self.mode == 'local':
-            windows = self.controller.list_windows()
-            if not windows:
-                session = self.controller.get_current_session()
-                print(f"No windows in session '{session}'")
-                return
-
-            session = self.controller.get_current_session()
-            print(f"Windows in session '{session}':")
-            for w in windows:
-                active = " *" if w['active'] else "  "
-                command = w.get('command', '')
-                print(f"{active} {w['index']:3} {w['name']:30} {command:20}")
-        else:
-            # Remote mode
-            windows = self.controller.list_windows()
-            if not windows:
-                print(f"No windows in session '{self.controller.session_name}'")
-                return
-
-            print(f"Windows in session '{self.controller.session_name}':")
-            for w in windows:
-                active = " (active)" if w['active'] else ""
-                print(f"  {w['index']}: {w['name']}{active} - pane {w['pane_id']}")
-
+    
     def cleanup(self):
-        """Clean up all tmux-cli managed windows."""
+        """Kill the entire managed session (remote mode only)."""
         if self.mode == 'local':
-            windows = self.controller.list_tmux_cli_windows()
-            if not windows:
-                print("No tmux-cli managed windows to clean up")
-                return
-
-            print(f"Cleaning up {len(windows)} tmux-cli window(s)...")
-            self.controller.cleanup_all_windows()
-            print("Cleanup complete")
-        else:
-            # Remote mode - kill entire session
-            print("Remote mode: Use 'tmux-cli cleanup' to kill the entire session")
-            self.controller.cleanup_session()
+            print("Cleanup is only available in remote mode (when outside tmux)")
+            return
+        self.controller.cleanup_session()
+    
+    def list_windows(self):
+        """List all windows in the session (remote mode only)."""
+        if self.mode == 'local':
+            print("List_windows is only available in remote mode. Use list_panes instead.")
+            return
+        
+        windows = self.controller.list_windows()
+        if not windows:
+            print(f"No windows in session '{self.controller.session_name}'")
+            return
+        
+        print(f"Windows in session '{self.controller.session_name}':")
+        for w in windows:
+            active = " (active)" if w['active'] else ""
+            print(f"  {w['index']}: {w['name']}{active} - pane {w['pane_id']}")
     
     def demo(self):
         """Run a demo showing tmux CLI control capabilities."""
